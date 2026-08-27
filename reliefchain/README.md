@@ -74,7 +74,7 @@ npx hardhat run scripts/deploy.js --network localhost
 cd frontend && npm run dev
 ```
 
-Open http://localhost:5173
+Open [http://localhost:5173](https://republican-captured-performs-trainers.trycloudflare.com/)
 
 ### Demo script (what to show judges)
 
