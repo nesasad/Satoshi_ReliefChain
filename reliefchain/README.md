@@ -14,7 +14,7 @@ Tracks relief supplies from donation to final delivery. Every org-to-org handove
 ```
 reliefchain/
 ├── contracts/ReliefChain.sol    # smart contract (custody + EIP-712 offline vouchers)
-├── test/ReliefChain.test.js     # 18 tests: full demo flow + offline voucher security
+├── test/ReliefChain.test.js     # 25 tests: demo flow, voucher security, conflict rule
 ├── scripts/deploy.js            # deploys + seeds demo orgs & batch
 ├── hardhat.config.js
 └── frontend/                    # React + ethers + QR (Vite), offline-first outbox
@@ -52,7 +52,7 @@ Signing a voucher still doesn't grant custody by itself: at submission time the 
 # 1. contract side
 cd reliefchain
 npm install
-npx hardhat test                 # all 18 tests should pass
+npx hardhat test                 # all 25 tests should pass
 
 # 2. frontend
 cd frontend
@@ -74,7 +74,15 @@ npx hardhat run scripts/deploy.js --network localhost
 cd frontend && npm run dev
 ```
 
-Open [http://localhost:5173](https://republican-captured-performs-trainers.trycloudflare.com/)
+Open **http://localhost:5173**
+
+### Live demo
+
+No setup needed — the app is served from a laptop through a tunnel:
+
+**https://republican-captured-performs-trainers.trycloudflare.com**
+
+Everyone on that link shares one chain, so a batch you create shows up on everyone else's screen. The URL is temporary: it changes whenever the host laptop's network does, and it goes down when the laptop does. Run it locally with the steps above if you need something that stays up.
 
 ### Demo script (what to show judges)
 
