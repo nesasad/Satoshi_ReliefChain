@@ -270,6 +270,42 @@ button:disabled {
 .badge.s2 { background: var(--success-deep);  color: var(--on-dark); }
 .badge.stale { background: var(--surface-soft); color: var(--mute); font-weight: 400; text-transform: none; }
 .badge.offline-tag { background: var(--ink); color: var(--on-dark); margin-left: 12px; }
+.badge.clash { background: var(--error); color: var(--on-dark); }
+
+/* ---------- Conflicting claims ---------- */
+
+.clash-warning {
+  font: 400 15px/1.6 var(--font);
+  color: var(--ink);
+  background: var(--canvas);
+  border: 1px solid var(--error);
+  border-left-width: 4px;
+  border-radius: var(--r);
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.voucher.clashing { border-color: var(--error); border-left-color: var(--error); }
+
+.claims { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--hairline); }
+.claims h3 {
+  display: flex; align-items: center; gap: 12px;
+  font: 700 18px/1.4 var(--font);
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+.claims .count {
+  font: 700 11px/1 var(--font);
+  background: var(--error); color: var(--on-dark);
+  border-radius: var(--r); padding: 5px 9px;
+}
+.claim {
+  background: var(--canvas);
+  border: 1px solid var(--hairline);
+  border-left: 4px solid var(--error);
+  border-radius: var(--r);
+  padding: 16px 20px;
+  margin-top: 12px;
+}
 
 .refresh {
   font: 700 16px/1 var(--font);
