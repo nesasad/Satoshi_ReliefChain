@@ -1,9 +1,13 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
 
 describe("ReliefChain", function () {
-  let relief, addr, chainId;
+  let relief, addr, chainId, domain;
   let admin, gov, ngo, local, donor, stranger, relayer;
+
+  const NOT_CURRENT_HOLDER = 0; // ConflictReason.NotCurrentHolder
+  const ALREADY_DELIVERED = 1;  // ConflictReason.AlreadyDelivered
 
   const HANDOVER_TYPES = {
     Handover: [
@@ -12,7 +16,8 @@ describe("ReliefChain", function () {
       { name: "to", type: "address" },
       { name: "note", type: "string" },
       { name: "signedAt", type: "uint256" },
-      { name: "nonce", type: "uint256" },
+      { name: "salt", type: "bytes32" },
+      { name: "epoch", type: "uint256" },
       { name: "deadline", type: "uint256" },
     ],
   };
@@ -28,47 +33,41 @@ describe("ReliefChain", function () {
       to: ngo.address,
       note: "Central warehouse handover",
       signedAt: t,
-      nonce: await relief.nonces(signer.address),
+      salt: ethers.hexlify(ethers.randomBytes(32)),
+      epoch: await relief.epochOf(signer.address),
       deadline: t + 3600,
       ...overrides,
     };
-    const domain = { name: "ReliefChain", version: "1", chainId, verifyingContract: addr };
-    const signature = await signer.signTypedData(domain, HANDOVER_TYPES, h);
-    return { h, signature };
+    return { h, signature: await signer.signTypedData(domain, HANDOVER_TYPES, h) };
   }
 
   beforeEach(async () => {
     [admin, gov, ngo, local, donor, stranger, relayer] = await ethers.getSigners();
-    const ReliefChain = await ethers.getContractFactory("ReliefChain");
-    relief = await ReliefChain.deploy();
+    relief = await (await ethers.getContractFactory("ReliefChain")).deploy();
     addr = await relief.getAddress();
     chainId = (await ethers.provider.getNetwork()).chainId;
+    domain = { name: "ReliefChain", version: "2", chainId, verifyingContract: addr };
 
-    await relief.registerOrg(gov.address, "Ministry of Interior", 0);   // Government
-    await relief.registerOrg(ngo.address, "Global Relief NGO", 1);      // NGO
-    await relief.registerOrg(local.address, "Local Relief Group", 2);   // LocalRelief
+    await relief.registerOrg(gov.address, "Public Safety Canada", 0);   // Government
+    await relief.registerOrg(ngo.address, "Canadian Red Cross", 1);     // NGO
+    await relief.registerOrg(local.address, "Yellowknife ESS", 2);      // LocalRelief
   });
 
   // ---------------- Core flow ----------------
 
   it("full flow: donate -> create -> transfer x2 -> deliver", async () => {
-    // Government creates a batch (QR issued with batchId = 1)
-    await expect(relief.connect(gov).createBatch("Emergency food kits x500", 500))
-      .to.emit(relief, "BatchCreated").withArgs(1, gov.address, "Emergency food kits x500", 500);
+    await expect(relief.connect(gov).createBatch("Evacuation kits x500", 500))
+      .to.emit(relief, "BatchCreated").withArgs(1, gov.address, "Evacuation kits x500", 500);
 
-    // Donor attaches funds
     await expect(relief.connect(donor).donate(1, { value: ethers.parseEther("1.0") }))
       .to.emit(relief, "DonationReceived").withArgs(1, donor.address, ethers.parseEther("1.0"));
 
-    // Gov -> NGO (QR scanned at warehouse, online)
-    await expect(relief.connect(gov).transferCustody(1, ngo.address, "Central warehouse handover"))
+    await expect(relief.connect(gov).transferCustody(1, ngo.address, "Staging area handover"))
       .to.emit(relief, "CustodyTransferred")
-      .withArgs(1, gov.address, ngo.address, "Central warehouse handover", false, anyUint());
+      .withArgs(1, gov.address, ngo.address, "Staging area handover", false, anyValue);
 
-    // NGO -> Local relief group
-    await relief.connect(ngo).transferCustody(1, local.address, "Regional depot handover");
+    await relief.connect(ngo).transferCustody(1, local.address, "Reception centre handover");
 
-    // Local group confirms final delivery with off-chain proof hash
     const proofHash = ethers.keccak256(ethers.toUtf8Bytes("delivery-proof-photo-001"));
     await expect(relief.connect(local).confirmDelivery(1, proofHash))
       .to.emit(relief, "DeliveryConfirmed").withArgs(1, local.address, proofHash);
@@ -124,44 +123,36 @@ describe("ReliefChain", function () {
     ).to.be.revertedWith("Not admin");
   });
 
-  // ---------------- Offline handover vouchers (EIP-712) ----------------
+  // ---------------- Offline handover vouchers ----------------
 
   describe("offline handover vouchers", () => {
     beforeEach(async () => {
-      await relief.connect(gov).createBatch("Emergency food kits x500", 500);
+      await relief.connect(gov).createBatch("Evacuation kits x500", 500);
     });
 
     it("a relayer can submit a handover signed offline, and the org spends no gas", async () => {
-      const { h, signature } = await signVoucher(gov, { note: "Handover at Pohang camp (offline)" });
+      const { h, signature } = await signVoucher(gov, { note: "Highway 3 checkpoint (offline)" });
       const govBalanceBefore = await ethers.provider.getBalance(gov.address);
 
       await expect(relief.connect(relayer).transferCustodyWithSig(h, signature))
         .to.emit(relief, "CustodyTransferred")
-        .withArgs(1, gov.address, ngo.address, "Handover at Pohang camp (offline)", true, h.signedAt);
+        .withArgs(1, gov.address, ngo.address, "Highway 3 checkpoint (offline)", true, h.signedAt);
 
-      // The signing org never touched the network — its balance is untouched.
       expect(await ethers.provider.getBalance(gov.address)).to.equal(govBalanceBefore);
-
-      const batch = await relief.getBatch(1);
-      expect(batch.currentHolder).to.equal(ngo.address);
-      expect(batch.status).to.equal(1); // InTransit
 
       const [rec] = await relief.getCustodyHistory(1);
       expect(rec.offline).to.equal(true);
-      expect(rec.signedAt).to.equal(h.signedAt);           // when it physically happened
-      expect(rec.recordedAt).to.be.gte(rec.signedAt);      // when the chain heard about it
-      expect(await relief.nonces(gov.address)).to.equal(1);
+      expect(rec.signedAt).to.equal(h.signedAt);
+      expect(rec.recordedAt).to.be.gte(rec.signedAt);
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
     });
 
     it("relays a whole offline queue in a single transaction", async () => {
-      // Two handovers signed hours apart in the field, both with no connectivity.
-      const first = await signVoucher(gov, { to: ngo.address, note: "Camp -> NGO truck" });
-      const second = await signVoucher(ngo, { to: local.address, note: "NGO truck -> village" });
+      const t = await now();
+      const first = await signVoucher(gov, { to: ngo.address, note: "Camp -> Red Cross truck", signedAt: t - 7200 });
+      const second = await signVoucher(ngo, { to: local.address, note: "Truck -> reception centre", signedAt: t - 3600 });
 
-      const tx = await relief
-        .connect(relayer)
-        .relayHandovers([first.h, second.h], [first.signature, second.signature]);
-      await tx.wait();
+      await relief.connect(relayer).relayHandovers([first.h, second.h], [first.signature, second.signature]);
 
       const history = await relief.getCustodyHistory(1);
       expect(history.length).to.equal(2);
@@ -174,11 +165,9 @@ describe("ReliefChain", function () {
     it("rejects a replayed voucher", async () => {
       const { h, signature } = await signVoucher(gov);
       await relief.connect(relayer).transferCustodyWithSig(h, signature);
-
-      // Same voucher, submitted again — nonce has already moved on.
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, signature)
-      ).to.be.revertedWith("Bad nonce");
+      ).to.be.revertedWith("Voucher already used");
     });
 
     it("rejects an expired voucher", async () => {
@@ -186,7 +175,6 @@ describe("ReliefChain", function () {
       const { h, signature } = await signVoucher(gov, { deadline: t + 60 });
       await ethers.provider.send("evm_increaseTime", [120]);
       await ethers.provider.send("evm_mine", []);
-
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, signature)
       ).to.be.revertedWith("Voucher expired");
@@ -201,68 +189,38 @@ describe("ReliefChain", function () {
     });
 
     it("rejects a forged voucher (signer is not the claimed holder)", async () => {
-      // stranger signs, but the voucher claims to come from the Government
       const t = await now();
       const h = {
-        batchId: 1,
-        from: gov.address,
-        to: ngo.address,
-        note: "forged",
-        signedAt: t,
-        nonce: await relief.nonces(gov.address),
-        deadline: t + 3600,
+        batchId: 1, from: gov.address, to: ngo.address, note: "forged",
+        signedAt: t, salt: ethers.hexlify(ethers.randomBytes(32)),
+        epoch: 0, deadline: t + 3600,
       };
-      const domain = { name: "ReliefChain", version: "1", chainId, verifyingContract: addr };
       const signature = await stranger.signTypedData(domain, HANDOVER_TYPES, h);
-
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, signature)
       ).to.be.revertedWith("Bad signature");
-    });
-
-    it("rejects a validly signed voucher from an org that isn't holding the batch", async () => {
-      const { h, signature } = await signVoucher(ngo, { to: local.address, note: "not mine to give" });
-      await expect(
-        relief.connect(relayer).transferCustodyWithSig(h, signature)
-      ).to.be.revertedWith("Not current holder");
     });
 
     it("rejects a voucher signed for a different chain", async () => {
-      const t = await now();
-      const h = {
-        batchId: 1, from: gov.address, to: ngo.address, note: "wrong chain",
-        signedAt: t, nonce: await relief.nonces(gov.address), deadline: t + 3600,
-      };
-      const domain = { name: "ReliefChain", version: "1", chainId: 999999n, verifyingContract: addr };
-      const signature = await gov.signTypedData(domain, HANDOVER_TYPES, h);
-
+      const { h } = await signVoucher(gov);
+      const wrongDomain = { ...domain, chainId: 999999n };
+      const signature = await gov.signTypedData(wrongDomain, HANDOVER_TYPES, h);
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, signature)
       ).to.be.revertedWith("Bad signature");
     });
 
-    it("invalidateVouchers burns every outstanding voucher (lost phone)", async () => {
-      const { h, signature } = await signVoucher(gov);
-
-      await expect(relief.connect(gov).invalidateVouchers())
-        .to.emit(relief, "VouchersInvalidated").withArgs(gov.address, 1);
-
+    it("rejects a voucher from an unregistered signer", async () => {
+      const t = await now();
+      const h = {
+        batchId: 1, from: stranger.address, to: ngo.address, note: "who?",
+        signedAt: t, salt: ethers.hexlify(ethers.randomBytes(32)),
+        epoch: 0, deadline: t + 3600,
+      };
+      const signature = await stranger.signTypedData(domain, HANDOVER_TYPES, h);
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, signature)
-      ).to.be.revertedWith("Bad nonce");
-    });
-
-    it("a bad voucher reverts the entire relay, never silently dropped", async () => {
-      const good = await signVoucher(gov, { to: ngo.address, note: "ok" });
-      const bad = await signVoucher(ngo, { to: local.address, note: "expired", deadline: 1 });
-
-      await expect(
-        relief.connect(relayer).relayHandovers([good.h, bad.h], [good.signature, bad.signature])
-      ).to.be.revertedWith("Voucher expired");
-
-      // Nothing was written — the good voucher is still spendable.
-      expect((await relief.getCustodyHistory(1)).length).to.equal(0);
-      expect(await relief.nonces(gov.address)).to.equal(0);
+      ).to.be.revertedWith("Signer not a registered org");
     });
 
     it("rejects a malformed signature and a mismatched relay", async () => {
@@ -270,26 +228,193 @@ describe("ReliefChain", function () {
       await expect(
         relief.connect(relayer).transferCustodyWithSig(h, "0x1234")
       ).to.be.revertedWith("Bad sig length");
-      await expect(
-        relief.connect(relayer).relayHandovers([h], [])
-      ).to.be.revertedWith("Length mismatch");
+      await expect(relief.connect(relayer).relayHandovers([h], [])).to.be.revertedWith("Length mismatch");
+      await expect(relief.connect(relayer).relayHandovers([], [])).to.be.revertedWith("Empty relay");
     });
 
     it("the on-chain digest matches what a phone signs offline", async () => {
       const { h, signature } = await signVoucher(gov);
-      const domain = { name: "ReliefChain", version: "1", chainId, verifyingContract: addr };
-
-      // The phone can verify, with no node, that it is signing the right thing.
       expect(await relief.hashHandover(h)).to.equal(
         ethers.TypedDataEncoder.hash(domain, HANDOVER_TYPES, h)
       );
       expect(ethers.verifyTypedData(domain, HANDOVER_TYPES, h, signature)).to.equal(gov.address);
     });
   });
-});
 
-/** chai matcher helper: accept any uint (block timestamps we don't control) */
-function anyUint() {
-  const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
-  return anyValue;
-}
+  // ---------------- Parallel offline signing (no nonce collisions) ----------------
+
+  describe("parallel offline signing", () => {
+    beforeEach(async () => {
+      await relief.connect(gov).createBatch("Evacuation kits x500", 500);   // batch 1
+      await relief.connect(gov).createBatch("Water bottles x1000", 1000);   // batch 2
+    });
+
+    it("two devices of the same org can sign different batches offline and BOTH land", async () => {
+      // The regression this replaces: with a sequential per-org nonce both devices
+      // computed the same value and one perfectly good handover was silently rejected.
+      const t = await now();
+      const deviceA = await signVoucher(gov, { batchId: 1, to: ngo.address, note: "device A", signedAt: t - 600 });
+      const deviceB = await signVoucher(gov, { batchId: 2, to: local.address, note: "device B", signedAt: t - 300 });
+
+      const res = await relief.connect(relayer).relayHandovers.staticCall(
+        [deviceA.h, deviceB.h], [deviceA.signature, deviceB.signature]
+      );
+      expect(res[0]).to.equal(2n); // both took custody
+      expect(res[1]).to.equal(0n); // no conflicts
+
+      await relief.connect(relayer).relayHandovers(
+        [deviceA.h, deviceB.h], [deviceA.signature, deviceB.signature]
+      );
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
+      expect((await relief.getBatch(2)).currentHolder).to.equal(local.address);
+    });
+
+    it("vouchers may be submitted in any order across devices", async () => {
+      const t = await now();
+      const a = await signVoucher(gov, { batchId: 1, to: ngo.address, signedAt: t - 600 });
+      const b = await signVoucher(gov, { batchId: 2, to: local.address, signedAt: t - 300 });
+
+      // b first, a second — no sequencing between independent batches
+      await relief.connect(relayer).transferCustodyWithSig(b.h, b.signature);
+      await relief.connect(relayer).transferCustodyWithSig(a.h, a.signature);
+
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
+      expect((await relief.getBatch(2)).currentHolder).to.equal(local.address);
+    });
+
+    it("a relay must be sorted by signedAt so the physical order is reconstructed", async () => {
+      const t = await now();
+      const earlier = await signVoucher(gov, { batchId: 1, to: ngo.address, signedAt: t - 7200 });
+      const later = await signVoucher(gov, { batchId: 2, to: local.address, signedAt: t - 60 });
+
+      await expect(
+        relief.connect(relayer).relayHandovers([later.h, earlier.h], [later.signature, earlier.signature])
+      ).to.be.revertedWith("Vouchers must be sorted by signedAt");
+
+      await relief.connect(relayer).relayHandovers(
+        [earlier.h, later.h], [earlier.signature, later.signature]
+      );
+      const [rec1] = await relief.getCustodyHistory(1);
+      const [rec2] = await relief.getCustodyHistory(2);
+      expect(rec1.signedAt).to.be.lt(rec2.signedAt);
+    });
+
+    it("invalidateVouchers burns every outstanding voucher across all devices", async () => {
+      const a = await signVoucher(gov, { batchId: 1, to: ngo.address, note: "device A" });
+      const b = await signVoucher(gov, { batchId: 2, to: local.address, note: "device B" });
+
+      await expect(relief.connect(gov).invalidateVouchers())
+        .to.emit(relief, "VouchersInvalidated").withArgs(gov.address, 1);
+
+      for (const v of [a, b]) {
+        await expect(
+          relief.connect(relayer).transferCustodyWithSig(v.h, v.signature)
+        ).to.be.revertedWith("Voucher revoked");
+      }
+
+      // A voucher signed after the bump carries the new epoch and works again.
+      const fresh = await signVoucher(gov, { batchId: 1, to: ngo.address });
+      expect(fresh.h.epoch).to.equal(1n);
+      await relief.connect(relayer).transferCustodyWithSig(fresh.h, fresh.signature);
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
+    });
+  });
+
+  // ---------------- The conflict rule ----------------
+
+  describe("conflict rule: two workers sign the same batch offline", () => {
+    beforeEach(async () => {
+      await relief.connect(gov).createBatch("Evacuation kits x500", 500);
+    });
+
+    it("first to sync wins custody; the loser is filed as a claim, not discarded", async () => {
+      const t = await now();
+      // Both workers hold the Government key, both offline, neither aware of the other.
+      const workerA = await signVoucher(gov, { to: ngo.address, note: "handed to Red Cross truck", signedAt: t - 3600 });
+      const workerB = await signVoucher(gov, { to: local.address, note: "handed to ESS van", signedAt: t - 1800 });
+
+      const res = await relief.connect(relayer).relayHandovers.staticCall(
+        [workerA.h, workerB.h], [workerA.signature, workerB.signature]
+      );
+      expect(res[0]).to.equal(1n); // one took custody
+      expect(res[1]).to.equal(1n); // one conflicted
+
+      await expect(
+        relief.connect(relayer).relayHandovers(
+          [workerA.h, workerB.h], [workerA.signature, workerB.signature]
+        )
+      ).to.emit(relief, "ConflictingClaimRecorded")
+       .withArgs(1, gov.address, local.address, workerB.h.signedAt, NOT_CURRENT_HOLDER);
+
+      // Custody went to the first voucher.
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
+      expect((await relief.getCustodyHistory(1)).length).to.equal(1);
+
+      // The losing handover survives, attributed and timestamped.
+      const claims = await relief.getConflictingClaims(1);
+      expect(claims.length).to.equal(1);
+      expect(claims[0].claimedFrom).to.equal(gov.address);
+      expect(claims[0].claimedTo).to.equal(local.address);
+      expect(claims[0].note).to.equal("handed to ESS van");
+      expect(claims[0].signedAt).to.equal(workerB.h.signedAt);
+      expect(claims[0].reason).to.equal(NOT_CURRENT_HOLDER);
+    });
+
+    it("a conflict never aborts the relay — unrelated handovers still land", async () => {
+      await relief.connect(gov).createBatch("Cots x200", 200); // batch 2, held by gov
+      const t = await now();
+      const winner   = await signVoucher(gov, { batchId: 1, to: ngo.address, signedAt: t - 5400 });
+      const loser    = await signVoucher(gov, { batchId: 1, to: local.address, signedAt: t - 3600 });
+      const unrelated = await signVoucher(gov, { batchId: 2, to: local.address, signedAt: t - 1800 });
+
+      await relief.connect(relayer).relayHandovers(
+        [winner.h, loser.h, unrelated.h],
+        [winner.signature, loser.signature, unrelated.signature]
+      );
+
+      expect((await relief.getBatch(1)).currentHolder).to.equal(ngo.address);
+      expect((await relief.getBatch(2)).currentHolder).to.equal(local.address); // unaffected
+      expect((await relief.getConflictingClaims(1)).length).to.equal(1);
+    });
+
+    it("a handover signed before a delivery that synced first is filed as AlreadyDelivered", async () => {
+      const t = await now();
+      const late = await signVoucher(ngo, { to: local.address, note: "late arrival", signedAt: t - 60 });
+
+      // Meanwhile the batch reached its destination and was closed out online.
+      await relief.connect(gov).transferCustody(1, ngo.address, "online hop");
+      await relief.connect(ngo).transferCustody(1, local.address, "online hop 2");
+      await relief.connect(local).confirmDelivery(1, ethers.ZeroHash);
+
+      await expect(relief.connect(relayer).transferCustodyWithSig(late.h, late.signature))
+        .to.emit(relief, "ConflictingClaimRecorded")
+        .withArgs(1, ngo.address, local.address, late.h.signedAt, ALREADY_DELIVERED);
+
+      const claims = await relief.getConflictingClaims(1);
+      expect(claims[0].reason).to.equal(ALREADY_DELIVERED);
+      expect((await relief.getBatch(1)).status).to.equal(2); // still Delivered
+    });
+
+    it("a losing voucher is spent, so it cannot be filed twice", async () => {
+      const t = await now();
+      const winner = await signVoucher(gov, { to: ngo.address, signedAt: t - 3600 });
+      const loser  = await signVoucher(gov, { to: local.address, signedAt: t - 1800 });
+
+      await relief.connect(relayer).transferCustodyWithSig(winner.h, winner.signature);
+      await relief.connect(relayer).transferCustodyWithSig(loser.h, loser.signature);
+      await expect(
+        relief.connect(relayer).transferCustodyWithSig(loser.h, loser.signature)
+      ).to.be.revertedWith("Voucher already used");
+
+      expect((await relief.getConflictingClaims(1)).length).to.equal(1);
+    });
+
+    it("the online path still reverts on a losing race — the caller is there to see it", async () => {
+      await relief.connect(gov).transferCustody(1, ngo.address, "gov -> ngo");
+      await expect(
+        relief.connect(gov).transferCustody(1, local.address, "gov again")
+      ).to.be.revertedWith("Not current holder");
+      expect((await relief.getConflictingClaims(1)).length).to.equal(0);
+    });
+  });
+});

@@ -13,8 +13,10 @@ export const RPC_URL =
 export const DEFAULT_CHAIN_ID = 31337n; // hardhat local node; refreshed from the RPC when online
 
 // The Handover struct, shared by the ABI and the EIP-712 signing types below.
+// `salt` (not a sequential nonce) is what makes a voucher unique, so any number of
+// field devices can sign at the same time with no coordination between them.
 const HANDOVER_TUPLE =
-  "tuple(uint256 batchId, address from, address to, string note, uint256 signedAt, uint256 nonce, uint256 deadline)";
+  "tuple(uint256 batchId, address from, address to, string note, uint256 signedAt, bytes32 salt, uint256 epoch, uint256 deadline)";
 
 // Human-readable ABI (ethers v6)
 export const ABI = [
@@ -25,21 +27,27 @@ export const ABI = [
   "function transferCustody(uint256 batchId, address to, string note)",
   "function confirmDelivery(uint256 batchId, bytes32 proofHash)",
   "function nextBatchId() view returns (uint256)",
-  "function nonces(address org) view returns (uint256)",
-  `function transferCustodyWithSig(${HANDOVER_TUPLE} h, bytes signature)`,
-  `function relayHandovers(${HANDOVER_TUPLE}[] hs, bytes[] signatures)`,
+  "function epochOf(address org) view returns (uint256)",
+  "function voucherSpent(bytes32 digest) view returns (bool)",
+  `function transferCustodyWithSig(${HANDOVER_TUPLE} h, bytes signature) returns (bool tookCustody)`,
+  `function relayHandovers(${HANDOVER_TUPLE}[] hs, bytes[] signatures) returns (uint256 tookCustody, uint256 conflicted)`,
   "function invalidateVouchers()",
   `function hashHandover(${HANDOVER_TUPLE} h) view returns (bytes32)`,
   "function DOMAIN_SEPARATOR() view returns (bytes32)",
   "function getBatch(uint256 batchId) view returns (tuple(uint256 id, string description, uint256 quantity, address creator, address currentHolder, uint8 status, uint256 donatedWei, uint256 createdAt, uint256 deliveredAt, bytes32 deliveryProofHash))",
   "function getCustodyHistory(uint256 batchId) view returns (tuple(address from, address to, uint256 recordedAt, uint256 signedAt, string note, bool offline)[])",
+  "function getConflictingClaims(uint256 batchId) view returns (tuple(address claimedFrom, address claimedTo, uint256 signedAt, uint256 recordedAt, string note, uint8 reason)[])",
   "function getOrg(address orgAddr) view returns (tuple(string name, uint8 orgType, bool registered))",
   "event BatchCreated(uint256 indexed batchId, address indexed creator, string description, uint256 quantity)",
   "event DonationReceived(uint256 indexed batchId, address indexed donor, uint256 amount)",
   "event CustodyTransferred(uint256 indexed batchId, address indexed from, address indexed to, string note, bool offline, uint256 signedAt)",
+  "event ConflictingClaimRecorded(uint256 indexed batchId, address indexed claimedFrom, address indexed claimedTo, uint256 signedAt, uint8 reason)",
   "event DeliveryConfirmed(uint256 indexed batchId, address indexed byOrg, bytes32 proofHash)",
-  "event VouchersInvalidated(address indexed org, uint256 newNonce)",
+  "event VouchersInvalidated(address indexed org, uint256 newEpoch)",
 ];
+
+/** ConflictReason enum, mirrored from the contract. */
+export const CONFLICT_REASONS = ["Custody had already moved on", "Batch was already delivered"];
 
 // ---------- EIP-712 offline handover vouchers ----------
 // A phone in a disaster zone signs this struct with NO network access. The signature
@@ -52,14 +60,15 @@ export const HANDOVER_TYPES = {
     { name: "to", type: "address" },
     { name: "note", type: "string" },
     { name: "signedAt", type: "uint256" },
-    { name: "nonce", type: "uint256" },
+    { name: "salt", type: "bytes32" },
+    { name: "epoch", type: "uint256" },
     { name: "deadline", type: "uint256" },
   ],
 };
 
 export const eip712Domain = (chainId) => ({
   name: "ReliefChain",
-  version: "1",
+  version: "2",
   chainId,
   verifyingContract: CONTRACT_ADDRESS,
 });
@@ -70,17 +79,35 @@ export const VOUCHER_TTL_SECONDS = 7 * 24 * 60 * 60;
 /** Compact wire format so a whole signed voucher fits comfortably in one QR code. */
 export const encodeVoucher = ({ h, signature }) =>
   JSON.stringify({
-    v: 1, b: Number(h.batchId), f: h.from, t: h.to, n: h.note,
-    s: Number(h.signedAt), o: Number(h.nonce), d: Number(h.deadline), g: signature,
+    v: 2, b: Number(h.batchId), f: h.from, t: h.to, n: h.note,
+    s: Number(h.signedAt), x: h.salt, e: Number(h.epoch), d: Number(h.deadline), g: signature,
   });
 
 export const decodeVoucher = (text) => {
   const p = JSON.parse(text);
-  if (p.v !== 1) throw new Error("Unsupported voucher version");
+  if (p.v !== 2) throw new Error("Unsupported voucher version");
   return {
-    h: { batchId: p.b, from: p.f, to: p.t, note: p.n, signedAt: p.s, nonce: p.o, deadline: p.d },
+    h: {
+      batchId: p.b, from: p.f, to: p.t, note: p.n,
+      signedAt: p.s, salt: p.x, epoch: p.e, deadline: p.d,
+    },
     signature: p.g,
   };
+};
+
+/**
+ * Two vouchers clash when they both move the same batch out of the same holder.
+ * Only one can win, so the outbox warns before the relayer spends gas on the loser.
+ */
+export const findClashes = (queue) => {
+  const seen = new Map();
+  const clashing = new Set();
+  queue.forEach((q, i) => {
+    const key = `${Number(q.h.batchId)}:${String(q.h.from).toLowerCase()}`;
+    if (seen.has(key)) { clashing.add(seen.get(key)); clashing.add(i); }
+    else seen.set(key, i);
+  });
+  return clashing;
 };
 
 // Hardhat local node default accounts — DEMO ONLY, never use on a real network.

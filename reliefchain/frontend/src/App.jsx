@@ -5,7 +5,7 @@ import QRScanner from "./components/QRScanner.jsx";
 import {
   CONTRACT_ADDRESS, RPC_URL, ABI, DEMO_ACCOUNTS, RELAYER, STATUS_LABELS, ORG_TYPE_LABELS,
   HANDOVER_TYPES, eip712Domain, VOUCHER_TTL_SECONDS, DEFAULT_CHAIN_ID,
-  encodeVoucher, decodeVoucher,
+  encodeVoucher, decodeVoucher, findClashes, CONFLICT_REASONS,
 } from "./config.js";
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -38,10 +38,11 @@ export default function App() {
   const [batches, setBatches] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [history, setHistory] = useState([]);
+  const [claims, setClaims] = useState([]);
   const [orgNames, setOrgNames] = useState({});
   const [scanning, setScanning] = useState(false);
   const [toast, setToast] = useState("");
-  const [desc, setDesc] = useState("Emergency food kits x500");
+  const [desc, setDesc] = useState("Evacuation kits x500");
   const [qty, setQty] = useState(500);
   const [donation, setDonation] = useState("0.5");
   const [transferTo, setTransferTo] = useState(3); // default: Local Relief
@@ -49,7 +50,7 @@ export default function App() {
   // ---- offline-first state ----
   const [online, setOnline] = useState(true);      // simulated connectivity
   const [queue, setQueue] = useState(readQueue);   // vouchers signed but not yet relayed
-  const [nonceCache, setNonceCache] = useState({}); // last known on-chain nonce per org
+  const [epochCache, setEpochCache] = useState({}); // last known on-chain epoch per org
   const [chainId, setChainId] = useState(DEFAULT_CHAIN_ID);
   const [voucherQr, setVoucherQr] = useState(null);
   const [syncing, setSyncing] = useState(false);
@@ -111,14 +112,18 @@ export default function App() {
     }
   }, [contract, online]);
 
-  /** Cache each org's nonce while we still have a network, so we can sign correctly offline. */
-  const refreshNonces = useCallback(async () => {
+  /**
+   * Cache each org's epoch while we still have a network. Unlike a sequential nonce
+   * this is not a counter we have to predict — it only moves when an org revokes its
+   * vouchers, so a stale cache costs nothing and devices never collide.
+   */
+  const refreshEpochs = useCallback(async () => {
     if (!online) return;
     try {
       const entries = await Promise.all(
-        [1, 2, 3].map(async (i) => [DEMO_ADDRESSES[i], Number(await contract.nonces(DEMO_ADDRESSES[i]))])
+        [1, 2, 3].map(async (i) => [DEMO_ADDRESSES[i], Number(await contract.epochOf(DEMO_ADDRESSES[i]))])
       );
-      setNonceCache(Object.fromEntries(entries));
+      setEpochCache(Object.fromEntries(entries));
     } catch (_) {}
   }, [contract, online]);
 
@@ -138,11 +143,25 @@ export default function App() {
         });
       }
       setHistory(rows);
+
+      const rawClaims = await contract.getConflictingClaims(id);
+      const claimRows = [];
+      for (const c of rawClaims) {
+        claimRows.push({
+          from: await addrToRole(c.claimedFrom),
+          to: await addrToRole(c.claimedTo),
+          signedAt: Number(c.signedAt),
+          recordedAt: Number(c.recordedAt),
+          note: c.note,
+          reason: CONFLICT_REASONS[Number(c.reason)] ?? "Unknown",
+        });
+      }
+      setClaims(claimRows);
     } catch (_) {}
   }, [contract, addrToRole, online]);
 
   useEffect(() => { loadBatches(); }, [loadBatches]);
-  useEffect(() => { refreshNonces(); }, [refreshNonces, batches]);
+  useEffect(() => { refreshEpochs(); }, [refreshEpochs, batches]);
   useEffect(() => {
     provider.getNetwork().then((n) => setChainId(n.chainId)).catch(() => {});
   }, []);
@@ -185,22 +204,24 @@ export default function App() {
   // ---------- Offline handover vouchers ----------
 
   /**
-   * Signs a handover with NO network access. The nonce comes from the last synced
-   * value plus however many vouchers this org already has waiting in the outbox —
-   * which is why a queue signed during a blackout still relays in order.
+   * Signs a handover with NO network access.
+   *
+   * The voucher is made unique by a locally generated random salt, not by a counter.
+   * That is the whole point: two field phones from the same organization can sign at
+   * the same moment, neither aware of the other, and both vouchers stay valid. The
+   * only cached value is the org's epoch, which moves only on revocation.
    */
   const signHandover = useCallback(async (batchId, note) => {
     const from = DEMO_ADDRESSES[roleIdx];
-    const to = DEMO_ADDRESSES[transferTo];
-    const queuedAhead = queue.filter((q) => q.h.from.toLowerCase() === from.toLowerCase()).length;
     const signedAt = Math.floor(Date.now() / 1000);
     const h = {
       batchId: Number(batchId),
       from,
-      to,
+      to: DEMO_ADDRESSES[transferTo],
       note,
       signedAt,
-      nonce: (nonceCache[from] ?? 0) + queuedAhead,
+      salt: ethers.hexlify(ethers.randomBytes(32)),
+      epoch: epochCache[from] ?? 0,
       deadline: signedAt + VOUCHER_TTL_SECONDS,
     };
     try {
@@ -208,7 +229,7 @@ export default function App() {
       setQueue((q) => [...q, { h, signature }]);
       notify(`📴 Signed offline — #${batchId} → ${DEMO_ACCOUNTS[transferTo].role} · ${queue.length + 1} queued for sync`);
     } catch (e) { notify(`❌ Signing failed: ${e.message}`); }
-  }, [roleIdx, transferTo, queue, nonceCache, signer, chainId]);
+  }, [roleIdx, transferTo, queue.length, epochCache, signer, chainId]);
 
   /** One action, two worlds: online it transacts, offline it signs and queues. */
   const handleHandover = async (id, note) => {
@@ -221,18 +242,35 @@ export default function App() {
     } catch (e) { notify(`❌ ${e.reason || e.message}`); }
   };
 
-  /** Connectivity restored: the whole outbox becomes ONE transaction, paid by the relayer. */
+  /**
+   * Connectivity restored: the whole outbox becomes ONE transaction, paid by the relayer.
+   *
+   * Sorted by signedAt first. That field is inside the signed payload, so ordering on it
+   * reconstructs the real sequence of handovers even across phones that never met — and
+   * the contract enforces the sort so a relayer cannot rewrite history by reordering.
+   */
   const syncQueue = async () => {
     if (!queue.length || syncing) return;
     setSyncing(true);
-    const n = queue.length;
+    const ordered = [...queue].sort((a, b) => Number(a.h.signedAt) - Number(b.h.signedAt));
+    const n = ordered.length;
     try {
-      const tx = n === 1
-        ? await relayerContract.transferCustodyWithSig(queue[0].h, queue[0].signature)
-        : await relayerContract.relayHandovers(queue.map((q) => q.h), queue.map((q) => q.signature));
+      const tx = await relayerContract.relayHandovers(
+        ordered.map((q) => q.h), ordered.map((q) => q.signature)
+      );
       const receipt = await tx.wait();
+
+      // Count how many lost a custody race and were filed as claims instead.
+      const conflicts = receipt.logs.filter((l) => {
+        try { return relayerContract.interface.parseLog(l)?.name === "ConflictingClaimRecorded"; }
+        catch { return false; }
+      }).length;
+
       setQueue([]);
-      notify(`📡 ${n} offline handover(s) recorded in ONE transaction — gas ${receipt.gasUsed.toString()}, paid by the relayer`);
+      notify(
+        `📡 ${n} offline handover(s) in ONE transaction — gas ${receipt.gasUsed.toString()}, paid by the relayer` +
+        (conflicts ? ` · ${conflicts} filed as conflicting claim(s)` : "")
+      );
       await loadBatches();
     } catch (e) {
       notify(`❌ Sync failed (queue kept): ${e.reason || e.shortMessage || e.message}`);
@@ -243,8 +281,14 @@ export default function App() {
   const submitVoucher = async (v) => {
     try {
       const tx = await relayerContract.transferCustodyWithSig(v.h, v.signature);
-      await tx.wait();
-      notify(`✅ Offline-signed handover recorded on-chain — batch #${v.h.batchId}`);
+      const receipt = await tx.wait();
+      const conflicted = receipt.logs.some((l) => {
+        try { return relayerContract.interface.parseLog(l)?.name === "ConflictingClaimRecorded"; }
+        catch { return false; }
+      });
+      notify(conflicted
+        ? `⚠ Batch #${v.h.batchId} had already moved on — filed as a conflicting claim, not discarded`
+        : `✅ Offline-signed handover recorded on-chain — batch #${v.h.batchId}`);
       setSelectedId(Number(v.h.batchId));
       await loadBatches();
     } catch (e) { notify(`❌ ${e.reason || e.shortMessage || e.message}`); }
@@ -257,7 +301,7 @@ export default function App() {
       await tx.wait();
       setQueue((q) => q.filter((x) => x.h.from.toLowerCase() !== DEMO_ADDRESSES[roleIdx].toLowerCase()));
       notify(`🔒 Every unsubmitted voucher signed by ${DEMO_ACCOUNTS[roleIdx].role} is now void`);
-      refreshNonces();
+      refreshEpochs();
     } catch (e) { notify(`❌ ${e.reason || e.message}`); }
   };
 
@@ -288,6 +332,14 @@ export default function App() {
   const selected = batches.find((b) => b.id === selectedId);
   const myAddress = signer.address;
   const isOrg = roleIdx >= 1 && roleIdx <= 3;
+
+  // Queued vouchers that move the same batch out of the same holder. Only one can
+  // win on sync, so say so before the relayer spends gas finding out.
+  const clashes = useMemo(() => findClashes(queue), [queue]);
+  const orderedQueue = useMemo(
+    () => queue.map((q, i) => ({ q, i })).sort((a, b) => Number(a.q.h.signedAt) - Number(b.q.h.signedAt)),
+    [queue]
+  );
 
   return (
     <div className="app">
@@ -403,14 +455,22 @@ export default function App() {
               📴 Offline outbox — signed, awaiting on-chain record <span className="count">{queue.length}</span>
             </h2>
             <p className="hint">
-              Handover vouchers signed with no connectivity. The signature itself is the evidence, so submitting them
-              later still records <strong>the moment the supplies actually changed hands</strong>.
+              Handover vouchers signed with no connectivity, listed in the order they will be relayed —
+              oldest signature first, so the chain ends up with the real field sequence. The signature itself is the
+              evidence, so submitting them later still records <strong>the moment the supplies actually changed hands</strong>.
             </p>
-            {queue.map((q, i) => (
-              <div className="voucher" key={`${q.h.from}-${q.h.nonce}`}>
+            {clashes.size > 0 && (
+              <p className="clash-warning">
+                ⚠ <strong>{clashes.size} vouchers move the same batch out of the same holder.</strong> Only the earliest
+                can take custody — the rest will be filed as conflicting claims for someone to reconcile. Nothing is lost,
+                but the field record disagrees with itself.
+              </p>
+            )}
+            {orderedQueue.map(({ q, i }) => (
+              <div className={`voucher${clashes.has(i) ? " clashing" : ""}`} key={q.h.salt}>
                 <div className="batch-head">
                   <strong>#{Number(q.h.batchId)} · {roleOfAddress(q.h.from)} → {roleOfAddress(q.h.to)}</strong>
-                  <span className="badge s1">nonce {Number(q.h.nonce)}</span>
+                  {clashes.has(i) && <span className="badge clash">conflicts</span>}
                 </div>
                 <div className="batch-meta">
                   Signed {fmt(q.h.signedAt)} · expires {fmt(q.h.deadline)} · <em>{q.h.note}</em>
@@ -471,6 +531,28 @@ export default function App() {
                 </li>
               )}
             </ol>
+
+            {claims.length > 0 && (
+              <div className="claims">
+                <h3>⚠ Conflicting claims <span className="count">{claims.length}</span></h3>
+                <p className="hint">
+                  Handovers that were validly signed in the field but arrived after custody had already moved on.
+                  Custody went to whoever synced first; these are kept — signed and attributed — so a handover that
+                  really happened is never erased. Each one needs a human to reconcile.
+                </p>
+                {claims.map((c, i) => (
+                  <div className="claim" key={i}>
+                    <div className="batch-head">
+                      <strong>{c.from} → {c.to}</strong>
+                      <span className="badge clash">{c.reason}</span>
+                    </div>
+                    <div className="batch-meta">
+                      Claimed handover {fmt(c.signedAt)} · filed {fmt(c.recordedAt)} · <em>{c.note}</em>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
       </main>
